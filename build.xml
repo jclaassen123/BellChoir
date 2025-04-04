@@ -1,0 +1,49 @@
+<project name="Hello" default="compile" basedir=".">
+  <!-- Set global properties for this build -->
+  <property name="src" location="src"/>
+  <property name="dist" location="dist"/>
+  <property name="libs" location="libs"/>
+
+  <!-- Define the preset for javac -->
+  <presetdef name="javac">
+    <javac includeantruntime="false"/>
+  </presetdef>
+
+  <!-- Initialize the directories -->
+  <target name="init">
+    <mkdir dir="${dist}"/>
+    <mkdir dir="${dist}/classes"/>
+  </target>
+
+  <!-- Compile the Java source files -->
+  <target name="compile" depends="init">
+    <javac srcdir="${src}" debug="true" destdir="${dist}/classes"/>
+  </target>
+
+  <!-- Create a JAR file for the project -->
+  <target name="jar" depends="init,compile">
+    <jar destfile="${dist}/${ant.project.name}.jar" basedir="${dist}/classes">
+      <manifest>
+        <attribute name="Main-Class" value="Conductor"/>
+      </manifest>
+    </jar>
+  </target>
+
+  <!-- Set a default song file if none is provided -->
+  <target name="songarg" unless="song">
+    <property name="song" value="${basedir}/MaryLamb.txt"/>
+  </target>
+
+  <!-- Run the application with the specified song file argument -->
+  <target name="run" depends="jar,songarg">
+    <java jar="${dist}/${ant.project.name}.jar" fork="true">
+      <!-- Pass the song file path as an argument -->
+      <arg value="${song}"/>
+    </java>
+  </target>
+
+  <!-- Clean the build output -->
+  <target name="clean">
+    <delete dir="${dist}"/>
+  </target>
+</project>
