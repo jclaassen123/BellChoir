@@ -12,13 +12,16 @@ import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.SourceDataLine;
 
 /**
- * The Conductor class is responsible for reading a song from a file and playing it.
- * It handles loading the notes from a file, creating player threads for each unique note,
- * and playing the song through the system's audio line.
+ * The Conductor class is responsible for loading and playing a song composed of musical notes.
+ * It reads notes from a file, delegates playback to Note-specific Player objects,
+ * and coordinates synchronized audio playback.
  */
 public class Conductor {
     private final AudioFormat af;
+    /** A map of Note objects to their corresponding Player thread. */
     private final Map<Note, Player> notePlayers;
+    /** A shared lock object used for synchronizing note playback. */
+    private final Object lock = new Object();
 
     /**
      * Constructor for the Conductor class.
@@ -34,7 +37,6 @@ public class Conductor {
      * The main method that starts the process of loading a song from a file and playing it.
      *
      * @param args The command-line arguments where the first argument is the filename of the song.
-     * @throws Exception if there is an error loading or playing the song.
      */
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
@@ -47,11 +49,16 @@ public class Conductor {
         Conductor t = new Conductor(af);
 
         List<BellNote> song = t.LoadNotes(filename);
-        t.playSong(song);
+        if (song != null){
+            t.playSong(song);
+        }
+        System.exit(0);
     }
+
 
     /**
      * Plays the song by passing each note to its respective player.
+     * Ensures that each note is played in sequence, waiting for the current note to finish before playing the next.
      *
      * @param song The list of BellNote objects representing the song.
      * @throws LineUnavailableException if the audio line cannot be opened or used.
@@ -63,15 +70,27 @@ public class Conductor {
 
             for (BellNote bn : song) {
                 Player player = getOrCreatePlayer(bn.note);
-                player.playNote(line, bn);
+                synchronized (lock) {
+                    player.playNote(line, bn, lock);
+                    try {
+                        lock.wait(); // wait for the note to finish playing before continuing
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                }
             }
-
             line.drain();
+
+            for (Player player : notePlayers.values()) {
+                player.stop();
+            }
         }
     }
 
+
     /**
      * Returns an existing player for the given note or creates a new one if it doesn't exist.
+     * Each player runs in its own thread and handles playback of a specific note.
      *
      * @param note The musical note for which to get or create a player.
      * @return The Player object associated with the given note.
@@ -88,47 +107,48 @@ public class Conductor {
 
     /**
      * Loads a list of BellNote objects from a file.
+     * Each line in the file should contain a note and its duration, separated by a space.
+     * For example: "C4 4, G3 2"
+     * Will return null if the file is invalid in any way.
      *
      * @param filename The name of the file containing the song.
      * @return A list of BellNote objects representing the song.
      */
     private List<BellNote> LoadNotes(String filename) {
         List<BellNote> song = new ArrayList<>();
-        boolean isEmpty = true; // Track if the file is empty
+        boolean isEmpty = true;
 
         try (BufferedReader br = new BufferedReader(new FileReader(filename))) {
             String line;
+            int lineIndex = 0;
             while ((line = br.readLine()) != null) {
-                isEmpty = false; // File has content
-
+                isEmpty = false;
+                lineIndex++;
                 String[] parts = line.split(" ");
                 if (parts.length == 2) {
-                    // Validate the note
                     Note note = validateNote(parts[0]);
                     if (note == null) {
-                        System.err.println("Invalid note: " + parts[0] + " in line: " + line);
-                        return null; // Stop processing and return null if the note is invalid
+                        System.err.println("Invalid note in line: " + line + "at txt index: " + lineIndex);
+                        return null;
                     }
 
-                    // Validate the note length
                     NoteLength length = validateNoteLength(parts[1]);
                     if (length == null) {
-                        System.err.println("Invalid note length: " + parts[1] + " in line: " + line);
-                        return null; // Stop processing and return null if the length is invalid
+                        System.err.println("Invalid note length in line: " + line + "at txt index: " + lineIndex);
+                        return null;
                     }
 
                     song.add(new BellNote(note, length));
                 } else {
-                    System.err.println("Invalid line format: " + line);
-                    return null; // Stop processing and return null if the line format is invalid
+                    System.err.println("Invalid line format: " + line + "at txt index: " + lineIndex);
+                    return null;
                 }
             }
         } catch (IOException | IllegalArgumentException e) {
-            System.err.println("Error loading notes: " + e.getMessage());
-            return null; // Return null if there's any error during file reading
+            System.err.println("Error Loading Notes from file: " + filename);
+            return null;
         }
 
-        // If the file was empty, print a message
         if (isEmpty) {
             System.err.println("The file is empty.");
             return null;
@@ -169,36 +189,93 @@ public class Conductor {
 
     /**
      * Player class that represents a unique player for a musical note.
-     * The player is responsible for playing a note through the audio line.
+     * Each Player runs in its own thread and is responsible for playing one specific note.
      */
-    private static class Player implements Runnable {
+    public class Player implements Runnable {
+        /** The musical note this player is responsible for playing. */
         private final Note note;
+        /** Indicates whether there is a note queued to be played. */
+        private volatile boolean hasNoteToPlay = false;
+        /** The current BellNote to be played. */
+        private BellNote currentNote;
+        /** The audio line used for playback. */
+        private SourceDataLine line;
+        /** A shared lock object used to notify the Conductor when playback is complete. */
+        private Object lock;
+        /** Indicates whether the player thread should continue running. */
+        private volatile boolean running = true;
 
         /**
-         * Constructor for the Player class.
+         * Constructs a Player for a specific note.
          *
-         * @param note The musical note this player will play.
+         * @param note The musical note this player is assigned to handle.
          */
-        Player(Note note) {
+        public Player(Note note) {
             this.note = note;
         }
 
-        @Override
-        public void run() {
-            // The thread runs to manage the playback of a note, if needed.
+        /**
+         * Queues a BellNote for playback and wakes up the thread to begin playing it.
+         *
+         * @param line The audio line used to output sound.
+         * @param bn   The BellNote (note + duration) to be played.
+         * @param lock The lock object used for synchronization with the Conductor.
+         */
+        public void playNote(SourceDataLine line, BellNote bn, Object lock) {
+            synchronized (this) {
+                this.line = line;
+                this.currentNote = bn;
+                this.lock = lock;
+                hasNoteToPlay = true;
+                notify(); // Wake up this thread to play the note
+            }
         }
 
         /**
-         * Plays a given note using the provided audio line and BellNote.
-         *
-         * @param line The SourceDataLine used to play the audio.
-         * @param bn The BellNote object representing the note and its length.
+         * The main execution loop for the Player thread.
+         * Waits until a note is available to play, plays it, and then notifies the Conductor.
          */
-        void playNote(SourceDataLine line, BellNote bn) {
-            // Play the note
-            final int ms = Math.min(bn.length.timeMs(), Note.MEASURE_LENGTH_SEC * 1000);
+        @Override
+        public void run() {
+            while (running) {
+                synchronized (this) {
+                    while (!hasNoteToPlay) {
+                        try {
+                            wait(); // Wait for a note to play
+                        } catch (InterruptedException ignored) {}
+                    }
+                }
+                playTone(line, currentNote);
+                synchronized (this) {
+                    hasNoteToPlay = false;
+                }
+
+                // Notify the conductor that this note has finished playing
+                synchronized (lock) {
+                    lock.notify();
+                }
+            }
+        }
+
+        /**
+         * Stops the Player thread from running.
+         * Call this when the application is shutting down or when playback is complete.
+         */
+        public void stop() {
+            running = false;
+        }
+
+        /**
+         * Plays the tone corresponding to the current BellNote for the specified duration.
+         * Includes a short pause after each note to separate them audibly.
+         *
+         * @param line        The audio line used for sound output.
+         * @param currentNote The BellNote (note and duration) to be played.
+         */
+        private void playTone(SourceDataLine line, BellNote currentNote) {
+            final int ms = Math.min(currentNote.length.timeMs(), Note.MEASURE_LENGTH_SEC * 1000);
             final int length = Note.SAMPLE_RATE * ms / 1000;
-            line.write(bn.note.sample(), 0, length);
+            line.write(currentNote.note.sample(), 0, length);
             line.write(Note.REST.sample(), 0, 50); // Short silence between notes
         }
     }
@@ -238,7 +315,7 @@ public class Conductor {
          *
          * @param length The relative length of the note (1.0f for WHOLE, etc.).
          */
-        private NoteLength(float length) {
+        NoteLength(float length) {
             timeMs = (int)(length * Note.MEASURE_LENGTH_SEC * 1000);
         }
 
@@ -255,6 +332,7 @@ public class Conductor {
     /**
      * Enum representing musical notes with their corresponding frequencies and sample data.
      */
+    //ChatGPT helped me with adding more notes. This includes the calculation of frequency.
     enum Note {
         REST,
         A0, B0, C0, C0S, D0, D0S, E0, F0, F0S, G0, G0S, A1, B1, C1, C1S, D1, D1S, E1, F1, F1S, G1, G1S,
@@ -274,7 +352,7 @@ public class Conductor {
         /**
          * Constructor for the Note enum that calculates the sine wave for the note's frequency.
          */
-        private Note() {
+        Note() {
             int n = this.ordinal();
             if (n > 0) {
                 final int halfStepsFromA4 = n - 44;
@@ -296,3 +374,4 @@ public class Conductor {
         }
     }
 }
+
